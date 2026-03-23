@@ -17,14 +17,15 @@ class MCPClient {
     this.nextId = 1;
   }
 
-  async start() {
+  async start(env = {}) {
     this.proc = spawn('node', [SERVER_PATH], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...process.env,
         OBSIDIAN_API_KEY: 'test-key',
         OBSIDIAN_HOST: 'http://127.0.0.1',
-        OBSIDIAN_PORT: '27124', // non-existent port for testing
+        OBSIDIAN_PORT: '27124',
+        ...env,
       },
     });
 
@@ -33,7 +34,6 @@ class MCPClient {
       this._processBuffer();
     });
 
-    // Wait for server to be ready (it logs to stderr)
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Server start timeout')), 5000);
       this.proc.stderr.on('data', (data) => {
@@ -50,10 +50,8 @@ class MCPClient {
   }
 
   _processBuffer() {
-    // MCP uses Content-Length framed JSON-RPC or newline-delimited JSON
-    // The SDK stdio transport uses newline-delimited JSON
     const lines = this.buffer.split('\n');
-    this.buffer = lines.pop(); // keep incomplete line in buffer
+    this.buffer = lines.pop();
 
     for (const line of lines) {
       if (!line.trim()) continue;
@@ -84,10 +82,22 @@ class MCPClient {
     });
   }
 
+  async initialize() {
+    await this.send('initialize', {
+      protocolVersion: '2025-06-18',
+      capabilities: {},
+      clientInfo: { name: 'test-client', version: '1.0.0' },
+    });
+    const notif = JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'notifications/initialized',
+    });
+    this.proc.stdin.write(notif + '\n');
+  }
+
   async stop() {
     if (this.proc) {
       this.proc.kill('SIGTERM');
-      // Wait for process to exit, but don't hang forever
       await Promise.race([
         once(this.proc, 'exit'),
         new Promise((r) => setTimeout(r, 2000)),
@@ -96,26 +106,20 @@ class MCPClient {
   }
 }
 
+// Helper to get error body from a tool call response
+function getError(res) {
+  assert.ok(res.result, 'Expected result');
+  assert.equal(res.result.isError, true);
+  return JSON.parse(res.result.content[0].text);
+}
+
 describe('Obsidian MCP Server', () => {
   let client;
 
   before(async () => {
     client = new MCPClient();
     await client.start();
-
-    // Initialize the MCP session
-    await client.send('initialize', {
-      protocolVersion: '2025-06-18',
-      capabilities: {},
-      clientInfo: { name: 'test-client', version: '1.0.0' },
-    });
-
-    // Send initialized notification (no response expected)
-    const notif = JSON.stringify({
-      jsonrpc: '2.0',
-      method: 'notifications/initialized',
-    });
-    client.proc.stdin.write(notif + '\n');
+    await client.initialize();
   });
 
   after(async () => {
@@ -161,8 +165,6 @@ describe('Obsidian MCP Server', () => {
       assert.deepEqual(tools.obsidian_search_vault.inputSchema.required, ['query']);
       assert.deepEqual(tools.obsidian_move_note.inputSchema.required, ['source', 'destination']);
       assert.deepEqual(tools.obsidian_delete_note.inputSchema.required, ['path']);
-
-      // These have no required fields
       assert.equal(tools.obsidian_list_vault.inputSchema.required, undefined);
       assert.equal(tools.obsidian_get_tags.inputSchema.required, undefined);
     });
@@ -174,9 +176,7 @@ describe('Obsidian MCP Server', () => {
         name: 'obsidian_nonexistent',
         arguments: {},
       });
-      assert.ok(res.result, 'Expected result');
-      assert.equal(res.result.isError, true);
-      const body = JSON.parse(res.result.content[0].text);
+      const body = getError(res);
       assert.ok(body.error.includes('Unknown tool'));
     });
 
@@ -185,9 +185,7 @@ describe('Obsidian MCP Server', () => {
         name: 'obsidian_list_vault',
         arguments: {},
       });
-      assert.ok(res.result, 'Expected result');
-      assert.equal(res.result.isError, true);
-      const body = JSON.parse(res.result.content[0].text);
+      const body = getError(res);
       assert.ok(
         body.error.includes('Cannot connect') || body.error.includes('ECONNREFUSED'),
         `Expected connection error, got: ${body.error}`
@@ -199,9 +197,7 @@ describe('Obsidian MCP Server', () => {
         name: 'obsidian_read_note',
         arguments: {},
       });
-      assert.ok(res.result);
-      assert.equal(res.result.isError, true);
-      const body = JSON.parse(res.result.content[0].text);
+      const body = getError(res);
       assert.ok(body.error.includes('path is required'));
     });
 
@@ -210,9 +206,7 @@ describe('Obsidian MCP Server', () => {
         name: 'obsidian_create_note',
         arguments: { path: 'test.md' },
       });
-      assert.ok(res.result);
-      assert.equal(res.result.isError, true);
-      const body = JSON.parse(res.result.content[0].text);
+      const body = getError(res);
       assert.ok(body.error.includes('content is required'));
     });
 
@@ -221,9 +215,7 @@ describe('Obsidian MCP Server', () => {
         name: 'obsidian_move_note',
         arguments: { source: 'a.md' },
       });
-      assert.ok(res.result);
-      assert.equal(res.result.isError, true);
-      const body = JSON.parse(res.result.content[0].text);
+      const body = getError(res);
       assert.ok(body.error.includes('destination is required'));
     });
 
@@ -232,10 +224,154 @@ describe('Obsidian MCP Server', () => {
         name: 'obsidian_search_vault',
         arguments: {},
       });
-      assert.ok(res.result);
-      assert.equal(res.result.isError, true);
-      const body = JSON.parse(res.result.content[0].text);
+      const body = getError(res);
       assert.ok(body.error.includes('query is required'));
     });
+  });
+
+  describe('path traversal protection', () => {
+    it('should reject paths with ..', async () => {
+      const res = await client.send('tools/call', {
+        name: 'obsidian_read_note',
+        arguments: { path: '../../../etc/passwd' },
+      });
+      const body = getError(res);
+      assert.ok(body.error.includes('Path traversal is not allowed'));
+    });
+
+    it('should reject paths with .. in the middle', async () => {
+      const res = await client.send('tools/call', {
+        name: 'obsidian_read_note',
+        arguments: { path: 'folder/../../../etc/passwd' },
+      });
+      const body = getError(res);
+      assert.ok(body.error.includes('Path traversal is not allowed'));
+    });
+
+    it('should reject dot segments', async () => {
+      const res = await client.send('tools/call', {
+        name: 'obsidian_delete_note',
+        arguments: { path: './../../secret.md' },
+      });
+      const body = getError(res);
+      assert.ok(body.error.includes('Path traversal is not allowed'));
+    });
+
+    it('should reject traversal in move source', async () => {
+      const res = await client.send('tools/call', {
+        name: 'obsidian_move_note',
+        arguments: { source: '../secret.md', destination: 'inbox/note.md' },
+      });
+      const body = getError(res);
+      assert.ok(body.error.includes('Path traversal is not allowed'));
+    });
+
+    it('should reject traversal in move destination', async () => {
+      const res = await client.send('tools/call', {
+        name: 'obsidian_move_note',
+        arguments: { source: 'inbox/note.md', destination: '../../etc/cron.d/evil' },
+      });
+      const body = getError(res);
+      assert.ok(body.error.includes('Path traversal is not allowed'));
+    });
+  });
+
+  describe('input type validation', () => {
+    it('should reject non-string path for read_note', async () => {
+      const res = await client.send('tools/call', {
+        name: 'obsidian_read_note',
+        arguments: { path: 123 },
+      });
+      const body = getError(res);
+      assert.ok(body.error.includes('path must be a string'));
+    });
+
+    it('should reject non-string content for create_note', async () => {
+      const res = await client.send('tools/call', {
+        name: 'obsidian_create_note',
+        arguments: { path: 'test.md', content: 123 },
+      });
+      const body = getError(res);
+      assert.ok(body.error.includes('content must be a string'));
+    });
+
+    it('should reject non-array tags for create_note', async () => {
+      const res = await client.send('tools/call', {
+        name: 'obsidian_create_note',
+        arguments: { path: 'test.md', content: 'hello', tags: 'not-an-array' },
+      });
+      const body = getError(res);
+      assert.ok(body.error.includes('tags must be an array'));
+    });
+
+    it('should reject non-string query for search', async () => {
+      const res = await client.send('tools/call', {
+        name: 'obsidian_search_vault',
+        arguments: { query: 42 },
+      });
+      const body = getError(res);
+      assert.ok(body.error.includes('query must be a string'));
+    });
+
+    it('should reject invalid mode for update_note', async () => {
+      const res = await client.send('tools/call', {
+        name: 'obsidian_update_note',
+        arguments: { path: 'test.md', content: 'hello', mode: 'invalid' },
+      });
+      const body = getError(res);
+      assert.ok(body.error.includes('mode must be'));
+    });
+  });
+
+  describe('error sanitization', () => {
+    it('should not leak secrets in error responses', async () => {
+      // The server uses a test API key, verify it never appears in errors
+      const res = await client.send('tools/call', {
+        name: 'obsidian_list_vault',
+        arguments: {},
+      });
+      const body = getError(res);
+      assert.ok(!body.error.includes('test-key'), 'Error should not contain API key');
+    });
+  });
+});
+
+describe('Startup validation', () => {
+  it('should exit if OBSIDIAN_API_KEY is not set', async () => {
+    const proc = spawn('node', [SERVER_PATH], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        OBSIDIAN_API_KEY: '',
+        OBSIDIAN_HOST: 'http://127.0.0.1',
+        OBSIDIAN_PORT: '27124',
+      },
+    });
+
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    const [code] = await once(proc, 'exit');
+    assert.equal(code, 1, 'Should exit with code 1');
+    assert.ok(stderr.includes('OBSIDIAN_API_KEY'), 'Should mention missing API key');
+  });
+
+  it('should exit if OBSIDIAN_PORT is invalid', async () => {
+    const proc = spawn('node', [SERVER_PATH], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        OBSIDIAN_API_KEY: 'test-key',
+        OBSIDIAN_HOST: 'http://127.0.0.1',
+        OBSIDIAN_PORT: 'not-a-number',
+      },
+    });
+
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    const [code] = await once(proc, 'exit');
+    assert.equal(code, 1, 'Should exit with code 1');
+    assert.ok(stderr.includes('Invalid OBSIDIAN_PORT'), 'Should mention invalid port');
   });
 });
